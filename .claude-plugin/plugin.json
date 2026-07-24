@@ -1,0 +1,9 @@
+{
+  "name": "fire-hotspot-download",
+  "description": "GIS skill for fire-hotspot-download",
+  "version": "0.1.0",
+  "author": "ruiduobao",
+  "skills": [
+    "fire-hotspot-download"
+  ]
+}
