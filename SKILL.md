@@ -1,15 +1,12 @@
 ---
-name: fire-hotspot-download
-display_name: 火点数据下载 (NASA FIRMS)
-version: 0.1.0
-author: ruiduobao
-license: MIT-0
-description: |
-  Download MODIS and VIIRS active fire hotspot data from NASA FIRMS.
+description: 'Download MODIS and VIIRS active fire hotspot data from NASA FIRMS.
+
   Supports filtering by date range, bounding box, and instrument.
+
   Outputs CSV and GeoJSON formats with near-real-time and standard products.
-runtime: python>=3.8
-tags: [gis, remote-sensing, fire, hotspot, modis, viirs, nasa, firms]
+
+  '
+name: fire-hotspot-download
 ---
 
 # Fire Hotspot Data Download
@@ -55,28 +52,28 @@ export FIRMS_API_KEY="your_api_key"
 
 ```bash
 # Download fire hotspots for China (last 7 days)
-python scripts/fire_hotspot_download.py download \
+python scripts\fire_hotspot_download.py download \
   --instrument VIIRS --product NRT \
   --bbox 73 18 135 54 \
   --start 2024-01-01 --end 2024-01-07 \
   --output china_fires.csv
 
 # Download MODIS fires as GeoJSON
-python scripts/fire_hotspot_download.py download \
+python scripts\fire_hotspot_download.py download \
   --instrument MODIS --product STANDARD \
   --bbox 116.0 39.5 116.8 40.2 \
   --start 2024-03-01 --end 2024-03-31 \
   --output beijing_fires.geojson --format geojson
 
 # Download both instruments
-python scripts/fire_hotspot_download.py download \
+python scripts\fire_hotspot_download.py download \
   --instrument BOTH --product NRT \
   --bbox -125 25 -66 50 \
   --start 2024-06-01 --end 2024-06-07 \
   --output us_fires.csv
 
 # List available instruments
-python scripts/fire_hotspot_download.py list-instruments
+python scripts\fire_hotspot_download.py list-instruments
 ```
 
 ## Parameters
@@ -169,7 +166,7 @@ The API supports max 7 days per NRT request. For longer periods:
 for week in {0..3}; do
   start=$(date -d "2024-01-01 +${week} weeks" +%Y-%m-%d)
   end=$(date -d "2024-01-01 +${week} weeks + 6 days" +%Y-%m-%d)
-  python scripts/fire_hotspot_download.py download \
+  python scripts\fire_hotspot_download.py download \
     --instrument VIIRS --product NRT \
     --bbox 73 18 135 54 \
     --start $start --end $end \
@@ -214,7 +211,7 @@ For global-scale analysis, split into regional tiles and download separately to 
 ### Automated Weekly Download
 ```bash
 # Download last 7 days of fire data for China
-python scripts/fire_hotspot_download.py download   --bbox 73 18 135 54 --instrument BOTH   --start $(date -d '7 days ago' +%Y-%m-%d)   --end $(date +%Y-%m-%d)   --output fires_weekly.csv
+python scripts\fire_hotspot_download.py download   --bbox 73 18 135 54 --instrument BOTH   --start $(date -d '7 days ago' +%Y-%m-%d)   --end $(date +%Y-%m-%d)   --output fires_weekly.csv
 ```
 
 ### CI/CD Integration (GitHub Actions)
@@ -236,7 +233,7 @@ jobs:
       - env:
           FIRMS_API_KEY: ${{ secrets.FIRMS_API_KEY }}
         run: |
-          python scripts/fire_hotspot_download.py download \
+          python scripts\fire_hotspot_download.py download \
             --bbox 73 18 135 54 --instrument BOTH \
             --start $(date -d '3 days ago' +%Y-%m-%d) \
             --end $(date +%Y-%m-%d) \
@@ -245,7 +242,7 @@ jobs:
 
 ### PostgreSQL/PostGIS Import
 ```bash
-python scripts/fire_hotspot_download.py download   --bbox 73 18 135 54 --start 2024-01-01 --end 2024-01-31   --output fires.csv
+python scripts\fire_hotspot_download.py download   --bbox 73 18 135 54 --start 2024-01-01 --end 2024-01-31   --output fires.csv
 
 psql -d gis_db -c "\COPY fire_hotspots(lat, lon, confidence, acq_date, instrument) FROM 'fires.csv' CSV HEADER"
 ```
@@ -285,7 +282,7 @@ psql -d gis_db -c "\COPY fire_hotspots(lat, lon, confidence, acq_date, instrumen
 
 ```bash
 # 设置 API 密钥
-python scripts/fire_hotspot_download.py set-key YOUR_API_KEY
+python scripts\fire_hotspot_download.py set-key YOUR_API_KEY
 
 # 或通过环境变量
 set FIRMS_API_KEY=your_api_key
@@ -295,28 +292,28 @@ set FIRMS_API_KEY=your_api_key
 
 ```bash
 # 下载中国区域火点（最近7天）
-python scripts/fire_hotspot_download.py download \
+python scripts\fire_hotspot_download.py download \
   --instrument VIIRS --product NRT \
   --bbox 73 18 135 54 \
   --start 2024-01-01 --end 2024-01-07 \
   --output china_fires.csv
 
 # 下载 MODIS 火点为 GeoJSON
-python scripts/fire_hotspot_download.py download \
+python scripts\fire_hotspot_download.py download \
   --instrument MODIS --product STANDARD \
   --bbox 116.0 39.5 116.8 40.2 \
   --start 2024-03-01 --end 2024-03-31 \
   --output beijing_fires.geojson --format geojson
 
 # 下载两种传感器数据
-python scripts/fire_hotspot_download.py download \
+python scripts\fire_hotspot_download.py download \
   --instrument BOTH --product NRT \
   --bbox -125 25 -66 50 \
   --start 2024-06-01 --end 2024-06-07 \
   --output us_fires.csv
 
 # 列出可用传感器
-python scripts/fire_hotspot_download.py list-instruments
+python scripts\fire_hotspot_download.py list-instruments
 ```
 
 ### 数据字段
