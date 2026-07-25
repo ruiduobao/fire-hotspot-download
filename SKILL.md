@@ -42,7 +42,7 @@ A free API key is required. Get one at: https://firms.modaps.eosdis.nasa.gov/api
 
 ```bash
 # Set your API key
-python scripts/fire-hotspot-download.py set-key YOUR_API_KEY
+python scripts\fire_hotspot_download.py set-key YOUR_API_KEY
 
 # Or set via environment variable
 export FIRMS_API_KEY="your_api_key"
