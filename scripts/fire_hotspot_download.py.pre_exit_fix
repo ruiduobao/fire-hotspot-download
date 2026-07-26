@@ -1,0 +1,627 @@
+#!/usr/bin/env python3
+"""
+NASA FIRMS Fire Hotspot Download CLI
+=====================================
+Download MODIS and VIIRS active fire hotspot data from NASA FIRMS.
+
+Privacy Notice:
+- This tool sends ONLY the following data to firms.modaps.eosdis.nasa.gov:
+  * Bounding box coordinates
+  * Date range
+  * Instrument selection
+- Your API key is stored locally in ~/.config/fire-hotspot-download/config.json
+  and is sent only to authenticate API requests.
+- NO personal data beyond the API key is sent.
+- All data is processed locally except the API request itself.
+
+License: MIT-0 (Public Domain)
+Data: NASA FIRMS, Public Domain
+"""
+
+import argparse
+import calendar
+import csv
+import json
+import os
+import sys
+from datetime import datetime, timedelta
+from pathlib import Path
+
+try:
+    import requests
+except ImportError:
+    print("Error: 'requests' package is required. Install with: pip install requests>=2.28.0")
+    sys.exit(1)
+
+# Local place-resolver (offline-first place name -> bbox lookup, batch3 v0.2.0+)
+try:
+    from place_resolver import (
+        resolve_place,
+        get_preset,
+        list_presets,
+        format_bbox,
+        PlaceNotFoundError,
+        PRESETS,
+    )
+except ImportError as _exc:
+    print(
+        f"Warning: place_resolver.py not found ({_exc}). "
+        "--place/--preset will be unavailable.",
+        file=sys.stderr,
+    )
+    PRESETS = {}
+
+    def resolve_place(*args, **kwargs):
+        raise RuntimeError("place_resolver.py missing — --place not available")
+
+    def get_preset(name):
+        raise ValueError(f"Unknown preset: {name} (place_resolver missing)")
+
+    def list_presets():
+        return "(place_resolver.py missing)"
+
+    def format_bbox(b):
+        return f"{b[0]} {b[1]} {b[2]} {b[3]}"
+
+    class PlaceNotFoundError(ValueError):
+        pass
+
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None
+
+# ── Constants ──────────────────────────────────────────────────────────────────
+FIRMS_API_BASE = "https://firms.modaps.eosdis.nasa.gov/api"
+AREA_ENDPOINT_CSV = f"{FIRMS_API_BASE}/area/csv"
+AREA_ENDPOINT_GEOJSON = f"{FIRMS_API_BASE}/geojson/area"
+MAP_KEY_URL = "https://firms.modaps.eosdis.nasa.gov/api/map_key/"
+
+CONFIG_DIR = Path.home() / ".config" / "fire-hotspot-download"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+
+INSTRUMENTS = {
+    "MODIS": {
+        "label": "MODIS (Terra+Aqua)",
+        "NRT": "MODIS_NRT",
+        "STANDARD": "MODIS_SP",
+        "description": "1km resolution, MCD14DL product",
+    },
+    "VIIRS": {
+        "label": "VIIRS (Suomi-NPP)",
+        "NRT": "VIIRS_SNPP_NRT",
+        "STANDARD": "VIIRS_SNPP_SP",
+        "description": "375m resolution, VNP14IMGTDL_NRT product",
+    },
+    "BOTH": {
+        "label": "MODIS + VIIRS Combined",
+        "NRT": "VIIRS_SNPP_NRT,MODIS_NRT",
+        "STANDARD": "VIIRS_SNPP_SP,MODIS_SP",
+        "description": "Combined MODIS and VIIRS data",
+    },
+}
+
+VALID_FORMATS = ["csv", "geojson"]
+
+# ── Config Management ──────────────────────────────────────────────────────────
+def load_config():
+    """Load configuration from file."""
+    if CONFIG_FILE.exists():
+        with open(CONFIG_FILE, "r") as f:
+            return json.load(f)
+    return {}
+
+def save_config(config):
+    """Save configuration to file."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(config, f, indent=2)
+    try:
+        os.chmod(CONFIG_FILE, 0o600)
+    except OSError:
+        pass
+
+def get_api_key():
+    """Get FIRMS API key from env or config."""
+    key = os.environ.get("FIRMS_API_KEY")
+    if key:
+        return key
+
+    config = load_config()
+    return config.get("api_key")
+
+# ── Validation ─────────────────────────────────────────────────────────────────
+def validate_bbox(bbox):
+    """Validate bounding box: west, south, east, north."""
+    if len(bbox) != 4:
+        raise ValueError("Bounding box must have 4 values: west south east north")
+    west, south, east, north = bbox
+    if not (-90 <= south <= 90) or not (-90 <= north <= 90):
+        raise ValueError("Latitude must be between -90 and 90")
+    if not (-180 <= west <= 180) or not (-180 <= east <= 180):
+        raise ValueError("Longitude must be between -180 and 180")
+    if south >= north:
+        raise ValueError(f"South ({south}) must be less than North ({north})")
+    if west >= east:
+        raise ValueError(f"West ({west}) must be less than East ({east})")
+    return west, south, east, north
+
+def validate_date_range(start_str, end_str, product):
+    """Validate date range."""
+    try:
+        start = datetime.strptime(start_str, "%Y-%m-%d")
+        end = datetime.strptime(end_str, "%Y-%m-%d")
+    except ValueError:
+        raise ValueError("Dates must be in YYYY-MM-DD format")
+
+    if end < start:
+        raise ValueError("End date must be >= start date")
+
+    # FIRMS NRT is limited to 1-5 days per area request
+    if product == "NRT":
+        max_range = timedelta(days=5)
+        if (end - start) > max_range:
+            raise ValueError("NRT product limited to 5-day range; use STANDARD for longer windows")
+    elif product == "STANDARD":
+        max_range = timedelta(days=365)
+        if (end - start) > max_range:
+            print("Warning: Standard product range > 1 year. Request may be large.")
+
+    return start, end
+
+def validate_instrument(instrument):
+    """Validate instrument selection."""
+    instrument = instrument.upper()
+    if instrument not in INSTRUMENTS:
+        raise ValueError(f"Unknown instrument: {instrument}. Valid: {', '.join(INSTRUMENTS.keys())}")
+    return instrument
+
+def validate_confidence(confidence):
+    """Validate confidence threshold."""
+    if confidence is not None:
+        if not (0 <= confidence <= 100):
+            raise ValueError("Confidence must be between 0 and 100")
+    return confidence
+
+# ── API Functions ──────────────────────────────────────────────────────────────
+def fetch_fire_data(api_key, instrument, product, bbox, start, end):
+    """Fetch fire hotspot data from FIRMS API."""
+    instrument_info = INSTRUMENTS[instrument]
+    source = instrument_info[product]
+
+    endpoint = AREA_ENDPOINT_CSV if source != "geojson" else AREA_ENDPOINT_GEOJSON
+
+    # Format: west,south,east,north
+    bbox_str = f"{bbox[0]},{bbox[1]},{bbox[2]},{bbox[3]}"
+
+    url = f"{endpoint}/{api_key}/{source}/{bbox_str}/{start.strftime('%Y-%m-%d')}/{end.strftime('%Y-%m-%d')}"
+
+    try:
+        resp = requests.get(url, timeout=120)
+        resp.raise_for_status()
+    except requests.exceptions.Timeout:
+        raise RuntimeError("Request timed out. Try a smaller date range or bbox.")
+    except requests.exceptions.ConnectionError:
+        raise RuntimeError("Connection error. Check your internet connection.")
+    except requests.exceptions.HTTPError as e:
+        if resp.status_code == 403:
+            raise RuntimeError("Authentication error. Check your API key.")
+        elif resp.status_code == 422:
+            raise RuntimeError(f"Invalid parameters: {resp.text[:200]}")
+        raise RuntimeError(f"HTTP error {resp.status_code}: {resp.text[:200]}")
+
+    return resp.text
+
+def parse_csv_data(csv_text, min_confidence=None):
+    """Parse CSV response into list of records."""
+    lines = csv_text.strip().split("\n")
+    if len(lines) < 2:
+        return []
+
+    reader = csv.DictReader(lines)
+    records = []
+    for row in reader:
+        if min_confidence is not None:
+            try:
+                conf = float(row.get("confidence", 0))
+                if conf < min_confidence:
+                    continue
+            except (ValueError, TypeError):
+                pass
+        records.append(dict(row))
+
+    return records
+
+def records_to_geojson(records):
+    """Convert records to GeoJSON FeatureCollection."""
+    features = []
+    for record in records:
+        try:
+            lat = float(record.get("latitude", 0))
+            lon = float(record.get("longitude", 0))
+        except (ValueError, TypeError):
+            continue
+
+        properties = {k: v for k, v in record.items() if k not in ("latitude", "longitude")}
+        feature = {
+            "type": "Feature",
+            "geometry": {
+                "type": "Point",
+                "coordinates": [lon, lat],
+            },
+            "properties": properties,
+        }
+        features.append(feature)
+
+    return {
+        "type": "FeatureCollection",
+        "features": features,
+    }
+
+# ── Output Functions ───────────────────────────────────────────────────────────
+def write_csv_output(records, output_path):
+    """Write records to CSV file."""
+    if not records:
+        print("Warning: No fire hotspots found.")
+        return
+
+    fieldnames = list(records[0].keys())
+    with open(output_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(records)
+    print(f"Written {len(records)} fire hotspot(s) to {output_path}")
+
+def write_geojson_output(records, output_path):
+    """Write records to GeoJSON file."""
+    geojson = records_to_geojson(records)
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(geojson, f, indent=2, ensure_ascii=False)
+    print(f"Written {len(geojson['features'])} fire hotspot(s) to {output_path}")
+
+# ── CLI Commands ───────────────────────────────────────────────────────────────
+def resolve_args(args) -> tuple:
+    """Resolve --bbox / --place / --preset and apply preset defaults to args.
+
+    Returns (bbox, source_label).
+    Also mutates args to fill in instrument / product / etc. from preset.
+    """
+    # Apply preset first so subsequent logic sees its defaults
+    if getattr(args, "preset", None):
+        p = get_preset(args.preset)
+        for k, v in p.items():
+            if k == "description":
+                continue
+            # Don't overwrite explicit user values; argparse defaults are still
+            # None until user passes them, except for instrument/product
+            # which have argparse defaults we should overwrite if preset has them.
+            current = getattr(args, k, None)
+            if k in ("instrument", "product") and current in (
+                "VIIRS",  # argparse default
+                "NRT",  # argparse default
+                None,
+            ):
+                setattr(args, k, v)
+            elif k == "bbox" and current is None:
+                setattr(args, k, v)
+
+    # --bbox wins
+    if getattr(args, "bbox", None) and len(args.bbox) == 4:
+        return validate_bbox(args.bbox), f"--bbox {format_bbox(args.bbox)}"
+
+    # --place
+    if getattr(args, "place", None):
+        try:
+            bbox = resolve_place(args.place)
+            return bbox, f"--place '{args.place}' → {format_bbox(bbox)}"
+        except PlaceNotFoundError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(2)
+
+    # --preset (if no bbox/place, fall back to preset's bbox)
+    if getattr(args, "preset", None):
+        p = get_preset(args.preset)
+        bbox = p["bbox"]
+        return bbox, f"--preset '{args.preset}' → {format_bbox(bbox)}"
+
+    raise ValueError(
+        "No spatial extent given. Provide one of: --bbox W S E N, "
+        "--place '北京市', or --preset <name>."
+    )
+
+
+def apply_days(args):
+    """If --days N is set and --start/--end are not, use last N days ending today.
+
+    FIRMS NRT is limited to 1-5 days per request (per their API). If user
+    asks for more, we switch to STANDARD instead of silently failing.
+    """
+    if getattr(args, "days", None) is None:
+        return
+    if args.start or args.end:
+        # user provided dates; --days is ignored
+        return
+    days = int(args.days)
+    if days < 1 or days > 365:
+        raise ValueError("--days must be between 1 and 365")
+    # FIRMS NRT area requests accept 1-5 days; if user asks for more, fall back
+    # to STANDARD which has no such limit.
+    if days > 5 and args.product.upper() == "NRT":
+        print(
+            f"Note: --days {days} > 5 but product=NRT (FIRMS NRT accepts 1-5 days). "
+            f"Switching to STANDARD for the {days}-day window.",
+            file=sys.stderr,
+        )
+        args.product = "STANDARD"
+    end = datetime.now().date() - timedelta(days=1)  # yesterday, to be safe
+    start = end - timedelta(days=days - 1)
+    args.start = start.strftime("%Y-%m-%d")
+    args.end = end.strftime("%Y-%m-%d")
+
+
+def cmd_download(args):
+    """Download fire hotspot data."""
+    api_key = get_api_key()
+    if not api_key:
+        print("Error: FIRMS API key not configured.")
+        print(f"Get a free key at: {MAP_KEY_URL}")
+        print("Then run: python scripts/fire-hotspot-download.py set-key YOUR_KEY")
+        print("   Or set FIRMS_API_KEY environment variable.")
+        sys.exit(1)
+
+    # Phase 2 round 2: --year/--season 展开
+    _apply_year_season(args)
+    # Resolve --days → --start/--end, then --place/--preset → --bbox
+    apply_days(args)
+    if not args.start or not args.end:
+        print("Error: --start and --end (or --days N) are required.", file=sys.stderr)
+        sys.exit(2)
+    bbox, source_label = resolve_args(args)
+
+    instrument = validate_instrument(args.instrument)
+    start, end = validate_date_range(args.start, args.end, args.product.upper())
+    confidence = validate_confidence(args.confidence)
+
+    print(f"Downloading fire hotspot data:")
+    print(f"  Instrument: {INSTRUMENTS[instrument]['label']}")
+    print(f"  Product: {args.product}")
+    print(f"  Period: {args.start} to {args.end}")
+    print(f"  BBox:   {bbox}  (from {source_label})")
+    if confidence is not None:
+        print(f"  Min confidence: {confidence}")
+
+    csv_text = fetch_fire_data(api_key, instrument, args.product.upper(), bbox, start, end)
+    records = parse_csv_data(csv_text, confidence)
+
+    if not records:
+        print("No fire hotspots found for the given criteria.", file=sys.stderr)
+        # Still write QA if requested (so the user can see what was searched)
+        if getattr(args, "qa", None):
+            _write_qa(args, bbox, source_label, instrument, 0)
+        sys.exit(0)
+
+    # Output
+    output_path = args.output
+    if args.format == "geojson" or output_path.endswith(".geojson"):
+        write_geojson_output(records, output_path)
+    else:
+        write_csv_output(records, output_path)
+
+    # Phase 2 round 2: write QA JSON
+    if getattr(args, "qa", None):
+        _write_qa(args, bbox, source_label, instrument, len(records))
+
+
+SEASON_MONTHS_FH = {
+    "spring": (3, 5), "summer": (6, 8), "autumn": (9, 11),
+    "fall": (9, 11), "winter": (12, 2),
+}
+
+
+def _apply_year_season(args):
+    """Apply --year/--season → --start/--end (and auto-switch product to STANDARD for >5d)."""
+    if args.season and not args.year:
+        print("ERROR: --season 必须配合 --year", file=sys.stderr)
+        sys.exit(2)
+    if not (args.year or args.season):
+        return
+    if args.season and args.year and not args.start:
+        s = args.season.lower()
+        if s not in SEASON_MONTHS_FH:
+            print(f"ERROR: --season must be one of {list(SEASON_MONTHS_FH.keys())}", file=sys.stderr)
+            sys.exit(2)
+        m1, m2 = SEASON_MONTHS_FH[s]
+        y = args.year
+        if m1 <= m2:
+            args.start = f"{y}-{m1:02d}-01"
+            last_day = calendar.monthrange(y, m2)[1]
+            args.end = f"{y}-{m2:02d}-{last_day}"
+        else:
+            args.start = f"{y}-{m1:02d}-01"
+            last_day = calendar.monthrange(y + 1, m2)[1]
+            args.end = f"{y + 1}-{m2:02d}-{last_day}"
+    elif args.year and not args.start:
+        y = args.year
+        args.start = f"{y}-01-01"
+        args.end = f"{y}-12-31"
+    # Auto-switch to STANDARD for year/season (NRT only supports 1-5 days)
+    if args.start and args.end and args.product == "NRT":
+        try:
+            from datetime import date
+            s = date.fromisoformat(args.start)
+            e = date.fromisoformat(args.end)
+            if (e - s).days > 5:
+                print(f"[fire-hotspot-download] period {(e - s).days} days > NRT 5-day cap; "
+                      f"auto-switching product to STANDARD", file=sys.stderr)
+                args.product = "STANDARD"
+        except Exception:
+            pass
+
+
+def _write_qa(args, bbox, source_label, instrument, fire_count):
+    """Write QA JSON for the fire-hotspot-download invocation."""
+    import json as _json
+    qa = {
+        "skill": "fire-hotspot-download",
+        "version": "0.3.0",
+        "query": {
+            "instrument": instrument,
+            "product": args.product,
+            "bbox": list(bbox) if bbox else None,
+            "bbox_source": source_label,
+            "start": args.start, "end": args.end,
+            "days": getattr(args, "days", None),
+            "year": getattr(args, "year", None),
+            "season": getattr(args, "season", None),
+            "preset": getattr(args, "preset", None),
+            "place": getattr(args, "place", None),
+            "confidence": args.confidence,
+        },
+        "fire_count": fire_count,
+        "output": args.output,
+        "format": args.format,
+    }
+    with open(args.qa, "w", encoding="utf-8") as f:
+        _json.dump(qa, f, ensure_ascii=False, indent=2)
+    print(f"[fire-hotspot-download] wrote QA to {args.qa}", file=sys.stderr)
+
+
+def cmd_list_instruments(args):
+    """List available instruments."""
+    print("=" * 70)
+    print("NASA FIRMS - Available Instruments")
+    print("=" * 70)
+    for inst, info in INSTRUMENTS.items():
+        print(f"\n  {inst}: {info['label']}")
+        print(f"    {info['description']}")
+        print(f"    NRT product: {info['NRT']}")
+        print(f"    Standard product: {info['STANDARD']}")
+    print()
+    print("=" * 70)
+    print(f"API Key: Get a free key at {MAP_KEY_URL}")
+
+
+def cmd_list_presets(args):
+    print(list_presets())
+
+
+def cmd_list_regions(args):
+    try:
+        from place_resolver import HARDCODED_BBOXES
+    except ImportError:
+        print("place_resolver.py missing", file=sys.stderr)
+        return
+    print(f"Offline region catalog ({len(HARDCODED_BBOXES)} entries):\n")
+    for key in sorted(HARDCODED_BBOXES.keys()):
+        bbox = HARDCODED_BBOXES[key]
+        print(f"  {key:<24} {format_bbox(bbox)}")
+
+
+def cmd_set_key(args):
+    """Set FIRMS API key."""
+    config = load_config()
+    config["api_key"] = args.api_key.strip()
+    save_config(config)
+    print(f"API key saved to {CONFIG_FILE}")
+    print("You can also set FIRMS_API_KEY environment variable.")
+
+# ── Main ───────────────────────────────────────────────────────────────────────
+def main():
+    parser = argparse.ArgumentParser(
+        prog="fire-hotspot-download",
+        description="Download NASA FIRMS MODIS/VIIRS active fire hotspot data",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples (with natural language place names + presets — batch3 v0.2.0+):
+
+  # Preset: china-fires = VIIRS NRT over China bbox
+  %(prog)s download --preset china-fires --days 7 --output china.csv
+
+  # --place: just say "长江流域" instead of bbox
+  %(prog)s download --place "长江流域" --days 3 --output yangtze.csv
+
+  # --bbox still works (highest priority)
+  %(prog)s download --instrument VIIRS --product NRT \\
+    --bbox 73 18 135 54 --days 7 --output china_fires.csv
+
+  %(prog)s set-key YOUR_FIRMS_API_KEY
+  %(prog)s list-instruments
+        """,
+    )
+
+    subparsers = parser.add_subparsers(dest="command", help="Available commands")
+
+    # Download command
+    dl = subparsers.add_parser("download", help="Download fire hotspot data")
+    dl.add_argument("--instrument", default="VIIRS",
+                    choices=list(INSTRUMENTS.keys()),
+                    help="Instrument: MODIS, VIIRS, or BOTH (default: VIIRS)")
+    dl.add_argument("--product", default="NRT", choices=["NRT", "STANDARD"],
+                    help="Product type: NRT or STANDARD (default: NRT)")
+    dl.add_argument("--bbox", nargs=4, type=float,
+                    metavar=("W", "S", "E", "N"),
+                    help="Bounding box: west south east north")
+    dl.add_argument("--place",
+                    help="Place name (e.g. '北京市', '长江流域'). Offline + Nominatim.")
+    dl.add_argument("--preset", choices=list(PRESETS.keys()),
+                    help="Apply a named preset (e.g. china-fires).")
+    dl.add_argument("--start",
+                    help="Start date (YYYY-MM-DD). Auto-set by --days.")
+    dl.add_argument("--end",
+                    help="End date (YYYY-MM-DD). Auto-set by --days.")
+    dl.add_argument("--days", type=int, default=None,
+                    help="Last N days from yesterday (e.g. --days 7). "
+                         "If --start/--end are not given, defaults to NRT-friendly window.")
+    dl.add_argument("--output", default="fire_hotspots.csv",
+                    help="Output file path (default: fire_hotspots.csv)")
+    dl.add_argument("--format", choices=["csv", "geojson"], default="csv",
+                    help="Output format (default: csv)")
+    dl.add_argument("--confidence", type=float, default=None,
+                    help="Minimum confidence threshold (0-100)")
+    # Phase 2 round 2: --year / --season / --qa (mirror landsat-download v0.2.0)
+    dl.add_argument("--year", type=int, default=None,
+                    help="Shortcut: --year 2024 → 2024 全年（自动切 STANDARD product）")
+    dl.add_argument("--season", choices=["spring", "summer", "autumn", "fall", "winter"],
+                    default=None,
+                    help="Northern-Hemisphere season（需配合 --year）")
+    dl.add_argument("--qa", metavar="PATH", default=None,
+                    help="Write a JSON QA summary (resolved args, output path, fire count) to PATH")
+    dl.set_defaults(func=cmd_download)
+
+    # List instruments command
+    li = subparsers.add_parser("list-instruments", help="List available instruments")
+    li.set_defaults(func=cmd_list_instruments)
+
+    # List-presets
+    lp = subparsers.add_parser("list-presets", help="List available --preset names")
+    lp.set_defaults(func=cmd_list_presets)
+
+    # List-regions
+    lr = subparsers.add_parser("list-regions", help="List offline-baked region names")
+    lr.set_defaults(func=cmd_list_regions)
+
+    # Set key command
+    sk = subparsers.add_parser("set-key", help="Set FIRMS API key")
+    sk.add_argument("api_key", help="Your FIRMS API key")
+    sk.set_defaults(func=cmd_set_key)
+
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        sys.exit(1)
+
+    try:
+        args.func(args)
+    except ValueError as e:
+        print(f"Validation error: {e}")
+        sys.exit(1)
+    except RuntimeError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print("\nInterrupted by user.")
+        sys.exit(130)
+
+if __name__ == "__main__":
+    main()
