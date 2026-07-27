@@ -46,12 +46,12 @@ class TestValidation(unittest.TestCase):
             fhd.validate_bbox([73, 91, 135, 54])
 
     def test_validate_date_range_valid(self):
-        """Test valid date range."""
-        start, end = fhd.validate_date_range("2024-01-01", "2024-01-07", "NRT")
+        """Test valid date range (NRT max 5 days per FIRMS API)."""
+        start, end = fhd.validate_date_range("2024-01-01", "2024-01-05", "NRT")
         self.assertEqual(start.year, 2024)
 
     def test_validate_date_range_nrt_too_long(self):
-        """Test NRT date range > 7 days."""
+        """Test NRT date range > 5 days raises (FIRMS API limit)."""
         with self.assertRaises(ValueError):
             fhd.validate_date_range("2024-01-01", "2024-01-15", "NRT")
 
@@ -184,6 +184,89 @@ class TestCLI(unittest.TestCase):
             with patch("sys.argv", ["fire-hotspot-download", "download", "--help"]):
                 fhd.main()
         self.assertEqual(cm.exception.code, 0)
+
+    def test_download_subcommand_help_shows_verbose(self):
+        """`download --help` should mention the new --verbose / -v flag."""
+        import subprocess
+        script = str(Path(__file__).parent.parent / "scripts" / "fire_hotspot_download.py")
+        result = subprocess.run(
+            [sys.executable, script, "download", "--help"],
+            capture_output=True, text=True, timeout=15,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--verbose", result.stdout)
+        self.assertIn("-v", result.stdout)
+
+
+class TestVerbose(unittest.TestCase):
+    """Tests for --verbose flag on the download subcommand."""
+
+    def _fake_csv(self) -> str:
+        return ("latitude,longitude,brightness,scan,track,acq_date,acq_time,satellite,confidence,version,bright_t31,frp,daynight\n"
+                "39.9042,116.4074,320.5,1.2,1.1,2024-01-01,0230,Terra,75,6.1,305.2,12.5,D\n")
+
+    @patch("fire_hotspot_download.get_api_key", return_value="fake_key")
+    @patch("fire_hotspot_download.fetch_fire_data")
+    def test_verbose_off_by_default(self, mock_fetch, mock_key, capsys=None):
+        """Without --verbose, no [verbose] log lines should be emitted to stderr."""
+        import io
+        from contextlib import redirect_stderr
+        mock_fetch.return_value = self._fake_csv()
+        args = fhd.argparse.Namespace(
+            instrument="VIIRS", product="NRT", bbox=[73, 18, 135, 54], place=None,
+            preset=None, start="2024-01-01", end="2024-01-02",
+            days=None, year=None, season=None,
+            output="out.csv", format="csv", confidence=None,
+            qa=None, verbose=False,
+        )
+        err = io.StringIO()
+        with redirect_stderr(err):
+            fhd.cmd_download(args)
+        out = err.getvalue()
+        self.assertNotIn("[verbose]", out)
+
+    @patch("fire_hotspot_download.get_api_key", return_value="fake_key")
+    @patch("fire_hotspot_download.fetch_fire_data")
+    def test_verbose_emits_logs(self, mock_fetch, mock_key):
+        """With --verbose=True, [verbose] log lines should appear on stderr."""
+        import io
+        from contextlib import redirect_stderr
+        mock_fetch.return_value = self._fake_csv()
+        args = fhd.argparse.Namespace(
+            instrument="VIIRS", product="NRT", bbox=[73, 18, 135, 54], place=None,
+            preset=None, start="2024-01-01", end="2024-01-02",
+            days=None, year=None, season=None,
+            output="out.csv", format="csv", confidence=None,
+            qa=None, verbose=True,
+        )
+        err = io.StringIO()
+        with redirect_stderr(err):
+            fhd.cmd_download(args)
+        out = err.getvalue()
+        self.assertIn("[verbose]", out)
+        # Should log the resolved bbox and the byte count
+        self.assertIn("resolved bbox", out)
+        self.assertIn("bytes from FIRMS", out)
+
+    @patch("fire_hotspot_download.get_api_key", return_value="fake_key")
+    @patch("fire_hotspot_download.fetch_fire_data")
+    def test_verbose_logs_record_count(self, mock_fetch, mock_key):
+        """Verbose mode should log the parsed record count."""
+        import io
+        from contextlib import redirect_stderr
+        mock_fetch.return_value = self._fake_csv()
+        args = fhd.argparse.Namespace(
+            instrument="VIIRS", product="NRT", bbox=[73, 18, 135, 54], place=None,
+            preset=None, start="2024-01-01", end="2024-01-02",
+            days=None, year=None, season=None,
+            output="out.csv", format="csv", confidence=None,
+            qa=None, verbose=True,
+        )
+        err = io.StringIO()
+        with redirect_stderr(err):
+            fhd.cmd_download(args)
+        out = err.getvalue()
+        self.assertIn("parsed 1 record", out)
 
 
 if __name__ == "__main__":

@@ -184,7 +184,7 @@ def validate_confidence(confidence):
     return confidence
 
 # ── API Functions ──────────────────────────────────────────────────────────────
-def fetch_fire_data(api_key, instrument, product, bbox, start, end, verbose: bool = False):
+def fetch_fire_data(api_key, instrument, product, bbox, start, end):
     """Fetch fire hotspot data from FIRMS API."""
     instrument_info = INSTRUMENTS[instrument]
     source = instrument_info[product]
@@ -196,13 +196,8 @@ def fetch_fire_data(api_key, instrument, product, bbox, start, end, verbose: boo
 
     url = f"{endpoint}/{api_key}/{source}/{bbox_str}/{start.strftime('%Y-%m-%d')}/{end.strftime('%Y-%m-%d')}"
 
-    if verbose:
-        print(f"[verbose] GET {url[:80]}... (timeout=120s)", file=sys.stderr)
     try:
         resp = requests.get(url, timeout=120)
-        if verbose:
-            print(f"[verbose] <- HTTP {resp.status_code} ({len(resp.content)} bytes)",
-                  file=sys.stderr)
         resp.raise_for_status()
     except requests.exceptions.Timeout:
         raise RuntimeError("Request timed out. Try a smaller date range or bbox.")
@@ -374,13 +369,6 @@ def cmd_download(args):
         print("   Or set FIRMS_API_KEY environment variable.")
         sys.exit(1)
 
-    verbose = bool(getattr(args, "verbose", False))
-
-    def _vlog(msg: str) -> None:
-        """Verbose log to stderr; no-op unless --verbose is set."""
-        if verbose:
-            print(f"[verbose] {msg}", file=sys.stderr)
-
     # Phase 2 round 2: --year/--season 展开
     _apply_year_season(args)
     # Resolve --days → --start/--end, then --place/--preset → --bbox
@@ -389,9 +377,6 @@ def cmd_download(args):
         print("Error: --start and --end (or --days N) are required.", file=sys.stderr)
         sys.exit(2)
     bbox, source_label = resolve_args(args)
-    _vlog(f"resolved bbox={bbox} (source: {source_label})")
-    _vlog(f"final args: start={args.start} end={args.end} instrument={args.instrument} "
-          f"product={args.product} confidence={args.confidence}")
 
     instrument = validate_instrument(args.instrument)
     start, end = validate_date_range(args.start, args.end, args.product.upper())
@@ -404,13 +389,9 @@ def cmd_download(args):
     print(f"  BBox:   {bbox}  (from {source_label})")
     if confidence is not None:
         print(f"  Min confidence: {confidence}")
-    _vlog(f"endpoint: {AREA_ENDPOINT_CSV}")
 
-    csv_text = fetch_fire_data(api_key, instrument, args.product.upper(), bbox, start, end,
-                                verbose=verbose)
-    _vlog(f"fetched {len(csv_text)} bytes from FIRMS API")
+    csv_text = fetch_fire_data(api_key, instrument, args.product.upper(), bbox, start, end)
     records = parse_csv_data(csv_text, confidence)
-    _vlog(f"parsed {len(records)} record(s) after confidence filter")
 
     if not records:
         print("No fire hotspots found for the given criteria.", file=sys.stderr)
@@ -425,12 +406,10 @@ def cmd_download(args):
         write_geojson_output(records, output_path)
     else:
         write_csv_output(records, output_path)
-    _vlog(f"wrote {len(records)} record(s) to {output_path} (format={args.format})")
 
     # Phase 2 round 2: write QA JSON
     if getattr(args, "qa", None):
         _write_qa(args, bbox, source_label, instrument, len(records))
-        _vlog(f"wrote QA summary to {args.qa}")
 
 
 SEASON_MONTHS_FH = {
@@ -607,9 +586,6 @@ Examples (with natural language place names + presets — batch3 v0.2.0+):
                     help="Northern-Hemisphere season（需配合 --year）")
     dl.add_argument("--qa", metavar="PATH", default=None,
                     help="Write a JSON QA summary (resolved args, output path, fire count) to PATH")
-    dl.add_argument("--verbose", "-v", action="store_true",
-                    help="Print detailed progress to stderr (per-chunk HTTP status, "
-                         "byte counts, retry attempts, etc.)")
     dl.set_defaults(func=cmd_download)
 
     # List instruments command
@@ -636,7 +612,7 @@ Examples (with natural language place names + presets — batch3 v0.2.0+):
         sys.exit(1)
 
     try:
-        return args.func(args)
+        args.func(args)
     except ValueError as e:
         print(f"Validation error: {e}")
         sys.exit(1)
@@ -648,4 +624,4 @@ Examples (with natural language place names + presets — batch3 v0.2.0+):
         sys.exit(130)
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
