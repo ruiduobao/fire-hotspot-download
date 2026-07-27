@@ -1,12 +1,6 @@
 ---
-description: 'Download MODIS and VIIRS active fire hotspot data from NASA FIRMS.
-
-  Supports filtering by date range, bounding box, and instrument.
-
-  Outputs CSV and GeoJSON formats with near-real-time and standard products.
-
-  '
 name: fire-hotspot-download
+description: 'Download MODIS and VIIRS active fire hotspot data from NASA FIRMS. description: 'Download MODIS and VIIRS active fire hotspot data from NASA FIRMS.  Supports filtering by date range, bounding box, and instrument.  Outputs CSV and GeoJSON formats with near-real-time and standard products.  '
 ---
 
 # Fire Hotspot Data Download
@@ -36,6 +30,18 @@ This data is essential for fire monitoring, air quality studies, and land manage
 - **API key management**: secure key storage in config file
 - **Progress tracking**: download progress with tqdm
 
+## Credentials
+
+This skill needs a **NASA FIRMS MAP_KEY** (free, issued per email).
+
+Resolution order:
+
+1. FIRMS_MAP_KEY env var
+2. ~/.netrc entry for machine firms.modaps.eosdis.nasa.gov (login = key)
+3. **Default** (geoskill-core credentials.py): empty — user must register
+
+Get a free key: https://firms.modaps.eosdis.nasa.gov/api/map_key/
+
 ## API Key
 
 A free API key is required. Get one at: https://firms.modaps.eosdis.nasa.gov/api/map_key/
@@ -47,6 +53,18 @@ python scripts\fire_hotspot_download.py set-key YOUR_API_KEY
 # Or set via environment variable
 export FIRMS_API_KEY="your_api_key"
 ```
+
+## Credentials
+
+This skill needs a **NASA FIRMS MAP_KEY** (free, issued per email).
+
+Resolution order:
+
+1. FIRMS_MAP_KEY env var
+2. ~/.netrc entry for machine firms.modaps.eosdis.nasa.gov (login = key)
+3. **Default** (geoskill-core credentials.py): empty — user must register
+
+Get a free key: https://firms.modaps.eosdis.nasa.gov/api/map_key/
 
 ## Usage
 
